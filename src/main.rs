@@ -30,6 +30,10 @@ error_chain! {
     }
 
     errors {
+        UnknownTopic(topic: String) {
+            description("Unknown topic"),
+            display("Unknown topic: {:?}", topic),
+        }
         TooManyCaps(desc: String) {
             description("Worker has too many capabilities"),
             display("{}", desc),
@@ -230,7 +234,7 @@ impl<S: Scope, D: Data> KafkaTopicSource<S, D> {
         }
     }
 
-    fn partition_ids(config: &ClientConfig, topic: &str) -> Result<Vec<i32>, impl ::std::error::Error> {
+    fn partition_ids(config: &ClientConfig, topic: &str) -> KtResult<Vec<i32>> {
         let consumer = config.create::<BaseConsumer>()?;
         let metadata = consumer.fetch_metadata(None, Duration::from_millis(100))?;
 
@@ -238,7 +242,7 @@ impl<S: Scope, D: Data> KafkaTopicSource<S, D> {
             .map(|topic| {
                 topic.partitions().iter().map(|p| p.id()).collect::<Vec<_>>()
             })
-            .ok_or(KafkaError::Subscription(format!("Missing topic: {:?}", topic)))
+            .ok_or(KtError::from(KtErrorKind::UnknownTopic(topic.to_string())))
     }
 }
 
