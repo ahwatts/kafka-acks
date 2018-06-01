@@ -2,12 +2,14 @@ extern crate differential_dataflow;
 extern crate rdkafka;
 extern crate timely;
 
+#[macro_use] extern crate error_chain;
+
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::message::{BorrowedMessage, Message};
 use rdkafka::{ClientConfig, TopicPartitionList};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -18,15 +20,21 @@ use timely::dataflow::operators::generic::source;
 use timely::dataflow::{Scope, Stream};
 use timely::progress::timestamp::RootTimestamp;
 
-fn partition_ids(config: &ClientConfig, topic: &str) -> Result<Vec<i32>, impl ::std::error::Error> {
-    let consumer = config.create::<BaseConsumer>()?;
-    let metadata = consumer.fetch_metadata(None, Duration::from_millis(100))?;
+error_chain! {
+    types {
+        KtError, KtErrorKind, KtResultExt, KtResult;
+    }
 
-    metadata.topics().iter().find(|t| t.name() == topic)
-        .map(|topic| {
-            topic.partitions().iter().map(|p| p.id()).collect::<Vec<_>>()
-        })
-        .ok_or(KafkaError::Subscription(format!("Missing topic: {:?}", topic)))
+    foreign_links {
+        Kafka(KafkaError);
+    }
+
+    errors {
+        TooManyCaps(desc: String) {
+            description("Worker has too many capabilities"),
+            display("{}", desc),
+        }
+    }
 }
 
 struct PartitionConsumer {
@@ -36,7 +44,7 @@ struct PartitionConsumer {
 }
 
 impl PartitionConsumer {
-    fn new<S: Into<String>>(config: &ClientConfig, topic: S, partition: i32) -> Result<PartitionConsumer, String> {
+    fn new<S: Into<String>>(config: &ClientConfig, topic: S, partition: i32) -> KtResult<PartitionConsumer> {
         let topic = topic.into();
         let consumer = config.create::<BaseConsumer>()
             .map_err(|e| format!("Error creating consumer: {}", e))?;
@@ -50,7 +58,8 @@ impl PartitionConsumer {
             topic: topic,
             partition: partition,
             consumer: consumer,
-        }) }
+        })
+    }
 
     // fn topic(&self) -> &str {
     //     &self.topic
@@ -60,7 +69,7 @@ impl PartitionConsumer {
     //     self.partition
     // }
 
-    fn poll(&self) -> Vec<BorrowedMessage> {
+    fn poll(&self) -> KtResult<Vec<BorrowedMessage>> {
         let mut rcvd_messages = Vec::new();
 
         loop {
@@ -72,11 +81,7 @@ impl PartitionConsumer {
                     break;
                 },
                 Some(Err(e)) => {
-                    eprintln!(
-                        "Error polling kafka topic {} partition {}: {}",
-                        self.topic, self.partition, e
-                    );
-                    break;
+                    return Err(KtError::from(e));
                 },
                 None => {
                     break;
@@ -84,7 +89,7 @@ impl PartitionConsumer {
             }
         }
 
-        rcvd_messages
+        Ok(rcvd_messages)
     }
 }
 
@@ -107,25 +112,27 @@ impl ConsumerBuilder {
         self.partition % peers == index
     }
 
-    fn build_consumer(&self) -> Result<PartitionConsumer, String> {
+    fn build_consumer(&self) -> KtResult<PartitionConsumer> {
         PartitionConsumer::new(&self.config, self.topic.clone(), self.partition)
     }
 }
 
-struct KafkaSource<S: Scope, D: Data> {
+struct KafkaPartitionSource<S: Scope, D: Data> {
     stream: Stream<S, D>,
-    _cap: Rc<RefCell<Option<Capability<S::Timestamp>>>>,
+    cap: Rc<RefCell<Option<Capability<S::Timestamp>>>>,
+    offsets: Rc<RefCell<BTreeSet<i64>>>
 }
 
-impl<S: Scope, D: Data> KafkaSource<S, D> {
-    fn new<L>(scope: &S, builder: ConsumerBuilder, logic: L) -> KafkaSource<S, D>
+impl<S: Scope, D: Data> KafkaPartitionSource<S, D> {
+    fn new<L>(scope: &S, builder: ConsumerBuilder, logic: L) -> KafkaPartitionSource<S, D>
         where L: 'static + Fn(&BorrowedMessage) -> Option<(S::Timestamp, D)>,
     {
         let cap_holder = Rc::new(RefCell::new(None));
+        let offsets = Rc::new(RefCell::new(BTreeSet::new()));
         let worker_id = scope.index() as i32;
         let num_workers = scope.peers() as i32;
 
-        let stream = source(scope, "KafkaSource", |cap| {
+        let stream = source(scope, "KafkaPartitionSource", |cap| {
             let mut jewels = None;
             if builder.build_for_worker(worker_id, num_workers) {
                 *cap_holder.borrow_mut() = Some(cap.clone());
@@ -138,7 +145,14 @@ impl<S: Scope, D: Data> KafkaSource<S, D> {
             move |output| {
                 if let Some((ref consumer, ref cap)) = jewels {
                     let mut old_ts = cap.time().clone();
-                    let messages = consumer.poll();
+
+                    let messages = match consumer.poll() {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("Worker {}/{}: Error polling Kafka for messages: {}", worker_id + 1, num_workers, e);
+                            Vec::new()
+                        }
+                    };
 
                     let mut processed = BTreeMap::new();
                     for message in messages {
@@ -169,10 +183,62 @@ impl<S: Scope, D: Data> KafkaSource<S, D> {
             }
         });
 
-        KafkaSource {
+        KafkaPartitionSource {
             stream: stream,
-            _cap: cap_holder,
+            cap: cap_holder,
+            offsets: offsets,
         }
+    }
+}
+
+struct KafkaTopicSource<S: Scope, D: Data> {
+    stream: Stream<S, D>,
+    cap: Rc<RefCell<Option<Capability<S::Timestamp>>>>,
+    offsets: Rc<RefCell<BTreeSet<i64>>>,
+}
+
+impl<S: Scope, D: Data> KafkaTopicSource<S, D> {
+    fn new<L>(scope: &S, config: ClientConfig, topic: &str, logic: L) -> KtResult<KafkaTopicSource<S, D>>
+        where L: 'static + Clone + Fn(&BorrowedMessage) -> Option<(S::Timestamp, D)>
+    {
+        let partition_ids = Self::partition_ids(&config, topic)
+            .expect("Could not fetch partition ids");
+
+        let mut partition_sources = Vec::new();
+        for partition_id in partition_ids {
+            let builder = ConsumerBuilder::new(config.clone(), topic, partition_id);
+            let source = KafkaPartitionSource::new(scope, builder, logic.clone());
+            partition_sources.push(source);
+        }
+
+        let streams = partition_sources.iter().map(|s| s.stream.clone()).collect::<Vec<_>>();
+        let mut active_sources = partition_sources.iter().filter(|s| s.cap.borrow().is_some());
+
+        let num_active = active_sources.clone().count();
+        if num_active > 1 {
+            Err(KtError::from(KtErrorKind::TooManyCaps(format!(
+                "Worker {}/{} has too many capabilities: {}. Do you need more worker threads?",
+                scope.index() + 1, scope.peers(), num_active,
+            ))))
+        } else {
+            let active_source = active_sources.next().unwrap();
+            Ok(KafkaTopicSource {
+                stream: scope.concatenate(streams),
+                cap: active_source.cap.clone(),
+                offsets: active_source.offsets.clone(),
+            })
+        }
+    }
+
+    fn partition_ids(config: &ClientConfig, topic: &str) -> Result<Vec<i32>, impl ::std::error::Error> {
+        let consumer = config.create::<BaseConsumer>()?;
+        let metadata = consumer.fetch_metadata(None, Duration::from_millis(100))?;
+
+        metadata.topics().iter().find(|t| t.name() == topic)
+            .map(|topic| {
+                topic.partitions().iter().map(|p| p.id()).collect::<Vec<_>>()
+            })
+            .ok_or(KafkaError::Subscription(format!("Missing topic: {:?}", topic)))
     }
 }
 
@@ -192,25 +258,17 @@ fn main() {
 
         worker.dataflow(move |scope| {
             let client_config = client_config.clone();
-            let partition_ids = partition_ids(&client_config, topic)
-                .expect("Could not fetch partition ids");
+            let source = KafkaTopicSource::new(scope, client_config, topic, |message| {
+                message.payload()
+                    .map(|v| String::from_utf8_lossy(v))
+                    .and_then(|s| u64::from_str(&s).ok())
+                    .map(|n| (RootTimestamp::new(n), n))
+            }).expect("Unable to create source");
 
-            // let sources = Vec::new();
-            for partition_id in partition_ids {
-                let builder = ConsumerBuilder::new(
-                    client_config.clone(), topic, partition_id
-                );
-                let source = KafkaSource::new(scope, builder, |message| {
-                    message.payload()
-                        .map(|v| String::from_utf8_lossy(v))
-                        .and_then(|s| u64::from_str(&s).ok())
-                        .map(|n| (RootTimestamp::new(n), n))
+            source.stream
+                .inspect_batch(|t, x| {
+                    println!("{:?}: {:?}", t, x);
                 });
-                source.stream
-                    .inspect_batch(|t, x| {
-                        println!("{:?}: {:?}", t, x);
-                    });
-            }
         });
     }).unwrap();
 }

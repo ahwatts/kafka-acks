@@ -5,5 +5,6 @@ authors = ["Andrew Watts <ahwatts@gmail.com>"]
 
 [dependencies]
 differential-dataflow = "^0.5.0"
+error-chain = "^0.11.0"
 rdkafka = "^0.16.0"
 timely = "^0.5.0"
