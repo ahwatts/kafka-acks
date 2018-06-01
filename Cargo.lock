@@ -99,6 +99,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 name = "kafka-acks"
 version = "0.1.0"
 dependencies = [
+ "abomonation 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "abomonation_derive 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "differential-dataflow 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "error-chain 0.11.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rdkafka 0.16.0 (registry+https://github.com/rust-lang/crates.io-index)",

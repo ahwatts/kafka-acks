@@ -1,7 +1,9 @@
+extern crate abomonation;
 extern crate differential_dataflow;
 extern crate rdkafka;
 extern crate timely;
 
+#[macro_use] extern crate abomonation_derive;
 #[macro_use] extern crate error_chain;
 
 use rdkafka::consumer::{BaseConsumer, Consumer};
@@ -137,6 +139,7 @@ impl<S: Scope, D: Data> KafkaPartitionSource<S, D> {
         let num_workers = scope.peers() as i32;
 
         let stream = source(scope, "KafkaPartitionSource", |cap| {
+            let offsets = offsets.clone();
             let mut jewels = None;
             if builder.build_for_worker(worker_id, num_workers) {
                 *cap_holder.borrow_mut() = Some(cap.clone());
@@ -164,7 +167,7 @@ impl<S: Scope, D: Data> KafkaPartitionSource<S, D> {
                             Some((timestamp, processed_message)) => {
                                 processed.entry(timestamp)
                                     .or_insert_with(|| Vec::new())
-                                    .push(processed_message);
+                                    .push((message, processed_message));
                             },
                             None => {
                                 println!("Dropping message with offset {}", message.offset());
@@ -176,8 +179,9 @@ impl<S: Scope, D: Data> KafkaPartitionSource<S, D> {
                         if block_ts >= old_ts {
                             let block_cap = cap.delayed(&block_ts);
                             let mut session = output.session(&block_cap);
-                            for message in block {
-                                session.give(message);
+                            for (orig, processed) in block {
+                                offsets.borrow_mut().insert(orig.offset());
+                                session.give(processed);
                             }
                         } else {
                             println!("Dropping a block of {} messages with a timestamp of {:?}, which is behind the current timestamp of {:?}", block.len(), block_ts, old_ts);
@@ -246,13 +250,20 @@ impl<S: Scope, D: Data> KafkaTopicSource<S, D> {
     }
 }
 
+#[derive(Abomonation, Clone, Debug)]
+struct DummyData {
+    data: u64,
+    partition: i32,
+    offset: i64,
+}
+
 fn main() {
     let topic = "random_numbers";
     let mut client_config = ClientConfig::new();
     client_config
         .set("api.version.request", "false")
         .set("broker.version.fallback", "0.9.0.1")
-        .set("auto.offset.reset", "earliest")
+        .set("auto.offset.reset", "latest")
         .set("group.id", "timely_kafka_test")
         .set("bootstrap.servers", "localhost:9092,localhost:9093,localhost:9094")
         .set("enable.auto.commit", "false");
@@ -266,7 +277,14 @@ fn main() {
                 message.payload()
                     .map(|v| String::from_utf8_lossy(v))
                     .and_then(|s| u64::from_str(&s).ok())
-                    .map(|n| (RootTimestamp::new(n), n))
+                    .map(|n| (
+                        RootTimestamp::new(n),
+                        DummyData {
+                            data: n,
+                            partition: message.partition(),
+                            offset: message.offset(),
+                        },
+                    ))
             }).expect("Unable to create source");
 
             source.stream
