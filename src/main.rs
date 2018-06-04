@@ -270,6 +270,8 @@ fn main() {
 
     timely::execute_from_args(env::args(), move |worker| {
         let client_config = client_config.clone();
+        let worker_id = worker.index() as i32;
+        let num_workers = worker.peers() as i32;
 
         worker.dataflow(move |scope| {
             let client_config = client_config.clone();
@@ -286,8 +288,34 @@ fn main() {
                         },
                     ))
             }).expect("Unable to create source");
+            let cap_holder = source.cap.clone();
 
             source.stream
+                .inspect_batch(move |ts, _| {
+                    let opt_cap = cap_holder.borrow().clone();
+                    if let Some(cap) = opt_cap {
+                        let ts2 = cap.time().clone();
+                        let cap_time = ts2.inner;
+                        let batch_time = ts.inner;
+
+                        let new_time = if batch_time > 5 {
+                            ::std::cmp::max(batch_time - 5, cap_time)
+                        } else {
+                            cap_time
+                        };
+
+                        if new_time != cap_time {
+                            println!("Worker {}/{}: b = {:?} c = {:?} n = {:?}",
+                                     worker_id + 1, num_workers,
+                                     batch_time, cap_time, new_time);
+                        }
+
+                        let mut new_ts = ts.clone();
+                        new_ts.inner = new_time;
+                        let new_cap = cap.delayed(&new_ts);
+                        *cap_holder.borrow_mut() = Some(new_cap);
+                    }
+                })
                 .inspect_batch(|t, x| {
                     println!("{:?}: {:?}", t, x);
                 });
