@@ -19,9 +19,10 @@ use std::str::FromStr;
 use std::time::Duration;
 use timely::Data;
 use timely::dataflow::operators::*;
+use timely::dataflow::operators::feedback::Handle as FeedbackHandle;
 use timely::dataflow::operators::generic::source;
 use timely::dataflow::scopes::{Child, Root};
-use timely::dataflow::{InputHandle, Scope, Stream};
+use timely::dataflow::Stream;
 use timely::progress::Timestamp;
 use timely::progress::nested::product::Product;
 use timely::progress::timestamp::RootTimestamp;
@@ -49,8 +50,8 @@ error_chain! {
 }
 
 struct PartitionConsumer {
-    topic: String,
-    partition: i32,
+    // topic: String,
+    // partition: i32,
     consumer: BaseConsumer,
 }
 
@@ -66,8 +67,8 @@ impl PartitionConsumer {
             .map_err(|e| format!("Error assigning topic partition to consumer: {}", e))?;
 
         Ok(PartitionConsumer {
-            topic: topic,
-            partition: partition,
+            // topic: topic,
+            // partition: partition,
             consumer: consumer,
         })
     }
@@ -131,11 +132,16 @@ impl ConsumerBuilder {
 struct KafkaPartitionSource<'a, A: Allocate, T: Timestamp, D: Data> {
     stream: Stream<Child<'a, Root<A>, T>, D>,
     cap: Rc<RefCell<Option<Capability<Product<RootTimestamp, T>>>>>,
-    offsets: Rc<RefCell<BTreeSet<i64>>>,
-    offset_handle: Rc<RefCell<InputHandle<T, (i32, i64)>>>,
+    // offsets: Rc<RefCell<BTreeSet<i64>>>,
+    offset_handle: FeedbackHandle<RootTimestamp, T, (i32, i64)>,
 }
 
-impl<'a, A: Allocate, T: Timestamp, D: Data> KafkaPartitionSource<'a, A, T, D> {
+impl<'a, A, T, D> KafkaPartitionSource<'a, A, T, D>
+    where A: Allocate,
+          T: Timestamp + From<u64>,
+          T::Summary: From<u64>,
+          D: Data,
+{
     fn new<L>(scope: &mut Child<'a, Root<A>, T>, builder: ConsumerBuilder, logic: L) -> KafkaPartitionSource<'a, A, T, D>
         where L: 'static + Fn(&BorrowedMessage) -> Option<(Product<RootTimestamp, T>, D)>,
     {
@@ -143,7 +149,8 @@ impl<'a, A: Allocate, T: Timestamp, D: Data> KafkaPartitionSource<'a, A, T, D> {
         let offsets = Rc::new(RefCell::new(BTreeSet::new()));
         let worker_id = scope.index() as i32;
         let num_workers = scope.peers() as i32;
-        let (input_handle, stream) = scope.new_input();
+        // let (offset_input_handle, offset_stream) = scope.new_input::<(i32, i64)>();
+        let (offset_input_handle, offset_stream) = scope.loop_variable::<(i32, i64)>(T::from(10), T::Summary::from(1));
 
         let stream = source(scope, "KafkaPartitionSource", |cap| {
             let offsets = offsets.clone();
@@ -198,11 +205,24 @@ impl<'a, A: Allocate, T: Timestamp, D: Data> KafkaPartitionSource<'a, A, T, D> {
             }
         });
 
+        let this_partition = builder.partition;
+        let offsets1 = offsets.clone();
+        offset_stream
+            .inspect(|x| {
+                println!("Offset stream got {:?}", x);
+            })
+            .broadcast()
+            .filter(move |(partition, _offset)| *partition == this_partition)
+            .inspect_batch(move |time, psnos| {
+                let offsets = offsets1.clone();
+                println!("Worker {}/{}: Retiring @ {:?}: {:?} (offsets len = {})", worker_id + 1, num_workers, time, psnos, offsets.borrow().len());
+            });
+
         KafkaPartitionSource {
             stream: stream,
             cap: cap_holder,
-            offsets: offsets,
-            offset_handle: Rc::new(RefCell::new(input_handle)),
+            // offsets: offsets,
+            offset_handle: offset_input_handle,
         }
     }
 }
@@ -210,10 +230,16 @@ impl<'a, A: Allocate, T: Timestamp, D: Data> KafkaPartitionSource<'a, A, T, D> {
 struct KafkaTopicSource<'a, A: Allocate, T: Timestamp, D: Data> {
     stream: Stream<Child<'a, Root<A>, T>, D>,
     cap: Rc<RefCell<Option<Capability<Product<RootTimestamp, T>>>>>,
-    offsets: Rc<RefCell<BTreeSet<i64>>>,
+    // offsets: Rc<RefCell<BTreeSet<i64>>>,
+    offset_handle: FeedbackHandle<RootTimestamp, T, (i32, i64)>,
 }
 
-impl<'a, A: Allocate, T: Timestamp, D: Data> KafkaTopicSource<'a, A, T, D> {
+impl<'a, A, T, D> KafkaTopicSource<'a, A, T, D>
+    where A: Allocate,
+          T: Timestamp + From<u64>,
+          T::Summary: From<u64>,
+          D: Data,
+{
     fn new<L>(scope: &mut Child<'a, Root<A>, T>, config: ClientConfig, topic: &str, logic: L) -> KtResult<KafkaTopicSource<'a, A, T, D>>
         where L: 'static + Clone + Fn(&BorrowedMessage) -> Option<(Product<RootTimestamp, T>, D)>
     {
@@ -228,20 +254,21 @@ impl<'a, A: Allocate, T: Timestamp, D: Data> KafkaTopicSource<'a, A, T, D> {
         }
 
         let streams = partition_sources.iter().map(|s| s.stream.clone()).collect::<Vec<_>>();
-        let mut active_sources = partition_sources.iter().filter(|s| s.cap.borrow().is_some());
+        let active_sources = partition_sources.into_iter().filter(|s| s.cap.borrow().is_some()).collect::<Vec<_>>();
 
-        let num_active = active_sources.clone().count();
+        let num_active = active_sources.len();
         if num_active > 1 {
             Err(KtError::from(KtErrorKind::TooManyCaps(format!(
                 "Worker {}/{} has too many capabilities: {}. Do you need more worker threads?",
                 scope.index() + 1, scope.peers(), num_active,
             ))))
         } else {
-            let active_source = active_sources.next().unwrap();
+            let active_source = active_sources.into_iter().next().unwrap();
             Ok(KafkaTopicSource {
                 stream: scope.concatenate(streams),
                 cap: active_source.cap.clone(),
-                offsets: active_source.offsets.clone(),
+                // offsets: active_source.offsets.clone(),
+                offset_handle: active_source.offset_handle,
             })
         }
     }
@@ -326,7 +353,9 @@ fn main() {
                 })
                 .inspect_batch(|t, x| {
                     println!("{:?}: {:?}", t, x);
-                });
+                })
+                .map(|x| (x.partition, x.offset))
+                .connect_loop(source.offset_handle);
         });
     }).unwrap();
 }
