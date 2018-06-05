@@ -19,7 +19,6 @@ use std::str::FromStr;
 use std::time::Duration;
 use timely::Data;
 use timely::dataflow::operators::*;
-// use timely::dataflow::operators::feedback::Handle as FeedbackHandle;
 use timely::dataflow::operators::generic::source;
 use timely::dataflow::scopes::{Child, Root};
 use timely::dataflow::{InputHandle, Stream};
@@ -50,8 +49,6 @@ error_chain! {
 }
 
 struct PartitionConsumer {
-    // topic: String,
-    // partition: i32,
     consumer: BaseConsumer,
 }
 
@@ -67,19 +64,9 @@ impl PartitionConsumer {
             .map_err(|e| format!("Error assigning topic partition to consumer: {}", e))?;
 
         Ok(PartitionConsumer {
-            // topic: topic,
-            // partition: partition,
             consumer: consumer,
         })
     }
-
-    // fn topic(&self) -> &str {
-    //     &self.topic
-    // }
-
-    // fn partition(&self) -> i32 {
-    //     self.partition
-    // }
 
     fn poll(&self) -> KtResult<Vec<BorrowedMessage>> {
         let mut rcvd_messages = Vec::new();
@@ -132,15 +119,13 @@ impl ConsumerBuilder {
 struct KafkaPartitionSource<'a, A: Allocate, T: Timestamp, D: Data> {
     stream: Stream<Child<'a, Root<A>, T>, D>,
     cap: Rc<RefCell<Option<Capability<Product<RootTimestamp, T>>>>>,
-    // offsets: Rc<RefCell<BTreeSet<i64>>>,
-    // offset_handle: FeedbackHandle<RootTimestamp, T, (i32, i64)>,
     offset_handle: InputHandle<T, (i32, i64)>,
+    offset_stream: Stream<Child<'a, Root<A>, T>, (i32, i64)>,
 }
 
 impl<'a, A, T, D> KafkaPartitionSource<'a, A, T, D>
     where A: Allocate,
-          T: Timestamp + From<u64>,
-          T::Summary: From<u64>,
+          T: Timestamp,
           D: Data,
 {
     fn new<L>(scope: &mut Child<'a, Root<A>, T>, builder: ConsumerBuilder, logic: L) -> KafkaPartitionSource<'a, A, T, D>
@@ -151,7 +136,6 @@ impl<'a, A, T, D> KafkaPartitionSource<'a, A, T, D>
         let worker_id = scope.index() as i32;
         let num_workers = scope.peers() as i32;
         let (offset_input_handle, offset_stream) = scope.new_input::<(i32, i64)>();
-        // let (offset_input_handle, offset_stream) = scope.loop_variable::<(i32, i64)>(T::from(10), T::Summary::from(1));
 
         let stream = source(scope, "KafkaPartitionSource", |cap| {
             let offsets = offsets.clone();
@@ -207,23 +191,17 @@ impl<'a, A, T, D> KafkaPartitionSource<'a, A, T, D>
         });
 
         let this_partition = builder.partition;
-        let offsets1 = offsets.clone();
-        offset_stream
-            .inspect(|x| {
-                println!("Offset stream got {:?}", x);
-            })
-            .broadcast()
-            .filter(move |(partition, _offset)| *partition == this_partition)
-            .inspect_batch(move |time, psnos| {
-                let offsets = offsets1.clone();
-                println!("Worker {}/{}: Retiring @ {:?}: {:?} (offsets len = {})", worker_id + 1, num_workers, time, psnos, offsets.borrow().len());
-            });
 
         KafkaPartitionSource {
             stream: stream,
             cap: cap_holder,
-            // offsets: offsets,
             offset_handle: offset_input_handle,
+            offset_stream: offset_stream
+                .broadcast()
+                .filter(move |(partition, _)| *partition == this_partition)
+                .inspect_batch(move |time, psnos| {
+                    println!("Worker {}/{}: Retiring at {:?}: {:?}", worker_id + 1, num_workers, time, psnos);
+                }),
         }
     }
 }
@@ -231,9 +209,8 @@ impl<'a, A, T, D> KafkaPartitionSource<'a, A, T, D>
 struct KafkaTopicSource<'a, A: Allocate, T: Timestamp, D: Data> {
     stream: Stream<Child<'a, Root<A>, T>, D>,
     cap: Rc<RefCell<Option<Capability<Product<RootTimestamp, T>>>>>,
-    // offsets: Rc<RefCell<BTreeSet<i64>>>,
-    // offset_handle: FeedbackHandle<RootTimestamp, T, (i32, i64)>,
     offset_handle: InputHandle<T, (i32, i64)>,
+    offset_stream: Stream<Child<'a, Root<A>, T>, (i32, i64)>,
 }
 
 impl<'a, A, T, D> KafkaTopicSource<'a, A, T, D>
@@ -269,8 +246,8 @@ impl<'a, A, T, D> KafkaTopicSource<'a, A, T, D>
             Ok(KafkaTopicSource {
                 stream: scope.concatenate(streams),
                 cap: active_source.cap.clone(),
-                // offsets: active_source.offsets.clone(),
                 offset_handle: active_source.offset_handle,
+                offset_stream: active_source.offset_stream,
             })
         }
     }
@@ -307,8 +284,8 @@ fn main() {
 
     timely::execute_from_args(env::args(), move |worker| {
         let client_config = client_config.clone();
-        // let worker_id = worker.index() as i32;
-        // let num_workers = worker.peers() as i32;
+        let worker_id = worker.index();
+        let num_workers = worker.peers();
 
         worker.dataflow(move |scope| {
             let client_config = client_config.clone();
@@ -345,9 +322,6 @@ fn main() {
                         };
 
                         if new_time != cap_time {
-                            // println!("Worker {}/{}: b = {:?} c = {:?} n = {:?}",
-                            //          worker_id + 1, num_workers,
-                            //          batch_time, cap_time, new_time);
                             let mut new_ts = ts.clone();
                             new_ts.inner = new_time;
                             let new_cap = cap.delayed(&new_ts);
@@ -355,14 +329,15 @@ fn main() {
                         }
                     }
                 })
-                .inspect_batch(|t, x| {
-                    println!("{:?}: {:?}", t, x);
+                .exchange(|x| x.data as u64 % 3)
+                .inspect_batch(move |t, x| {
+                    println!("Worker {}/{}: {:?}: {:?}", worker_id + 1, num_workers, t, x);
                 })
-                .inspect(move |x| {
-                    retrier.send((x.partition, x.offset));
+                .inspect_batch(move |_, xs| {
+                    let epoch = *retrier.epoch();
+                    retrier.send_batch(&mut xs.into_iter().map(|x| (x.partition, x.offset)).collect::<Vec<_>>());
+                    retrier.advance_to(epoch + 1);
                 })
-                // .map(|x| (x.partition, x.offset))
-                // .connect_loop(source.offset_handle)
                 ;
         });
     }).unwrap();
