@@ -2,6 +2,7 @@ extern crate abomonation;
 extern crate differential_dataflow;
 extern crate rdkafka;
 extern crate timely;
+extern crate timely_communication;
 
 #[macro_use] extern crate abomonation_derive;
 #[macro_use] extern crate error_chain;
@@ -19,8 +20,12 @@ use std::time::Duration;
 use timely::Data;
 use timely::dataflow::operators::*;
 use timely::dataflow::operators::generic::source;
-use timely::dataflow::{Scope, Stream};
+use timely::dataflow::scopes::{Child, Root};
+use timely::dataflow::{InputHandle, Scope, Stream};
+use timely::progress::Timestamp;
+use timely::progress::nested::product::Product;
 use timely::progress::timestamp::RootTimestamp;
+use timely_communication::Allocate;
 
 error_chain! {
     types {
@@ -123,20 +128,22 @@ impl ConsumerBuilder {
     }
 }
 
-struct KafkaPartitionSource<S: Scope, D: Data> {
-    stream: Stream<S, D>,
-    cap: Rc<RefCell<Option<Capability<S::Timestamp>>>>,
-    offsets: Rc<RefCell<BTreeSet<i64>>>
+struct KafkaPartitionSource<'a, A: Allocate, T: Timestamp, D: Data> {
+    stream: Stream<Child<'a, Root<A>, T>, D>,
+    cap: Rc<RefCell<Option<Capability<Product<RootTimestamp, T>>>>>,
+    offsets: Rc<RefCell<BTreeSet<i64>>>,
+    offset_handle: Rc<RefCell<InputHandle<T, (i32, i64)>>>,
 }
 
-impl<S: Scope, D: Data> KafkaPartitionSource<S, D> {
-    fn new<L>(scope: &S, builder: ConsumerBuilder, logic: L) -> KafkaPartitionSource<S, D>
-        where L: 'static + Fn(&BorrowedMessage) -> Option<(S::Timestamp, D)>,
+impl<'a, A: Allocate, T: Timestamp, D: Data> KafkaPartitionSource<'a, A, T, D> {
+    fn new<L>(scope: &mut Child<'a, Root<A>, T>, builder: ConsumerBuilder, logic: L) -> KafkaPartitionSource<'a, A, T, D>
+        where L: 'static + Fn(&BorrowedMessage) -> Option<(Product<RootTimestamp, T>, D)>,
     {
         let cap_holder = Rc::new(RefCell::new(None));
         let offsets = Rc::new(RefCell::new(BTreeSet::new()));
         let worker_id = scope.index() as i32;
         let num_workers = scope.peers() as i32;
+        let (input_handle, stream) = scope.new_input();
 
         let stream = source(scope, "KafkaPartitionSource", |cap| {
             let offsets = offsets.clone();
@@ -195,19 +202,20 @@ impl<S: Scope, D: Data> KafkaPartitionSource<S, D> {
             stream: stream,
             cap: cap_holder,
             offsets: offsets,
+            offset_handle: Rc::new(RefCell::new(input_handle)),
         }
     }
 }
 
-struct KafkaTopicSource<S: Scope, D: Data> {
-    stream: Stream<S, D>,
-    cap: Rc<RefCell<Option<Capability<S::Timestamp>>>>,
+struct KafkaTopicSource<'a, A: Allocate, T: Timestamp, D: Data> {
+    stream: Stream<Child<'a, Root<A>, T>, D>,
+    cap: Rc<RefCell<Option<Capability<Product<RootTimestamp, T>>>>>,
     offsets: Rc<RefCell<BTreeSet<i64>>>,
 }
 
-impl<S: Scope, D: Data> KafkaTopicSource<S, D> {
-    fn new<L>(scope: &S, config: ClientConfig, topic: &str, logic: L) -> KtResult<KafkaTopicSource<S, D>>
-        where L: 'static + Clone + Fn(&BorrowedMessage) -> Option<(S::Timestamp, D)>
+impl<'a, A: Allocate, T: Timestamp, D: Data> KafkaTopicSource<'a, A, T, D> {
+    fn new<L>(scope: &mut Child<'a, Root<A>, T>, config: ClientConfig, topic: &str, logic: L) -> KtResult<KafkaTopicSource<'a, A, T, D>>
+        where L: 'static + Clone + Fn(&BorrowedMessage) -> Option<(Product<RootTimestamp, T>, D)>
     {
         let partition_ids = Self::partition_ids(&config, topic)
             .expect("Could not fetch partition ids");
@@ -270,8 +278,8 @@ fn main() {
 
     timely::execute_from_args(env::args(), move |worker| {
         let client_config = client_config.clone();
-        let worker_id = worker.index() as i32;
-        let num_workers = worker.peers() as i32;
+        // let worker_id = worker.index() as i32;
+        // let num_workers = worker.peers() as i32;
 
         worker.dataflow(move |scope| {
             let client_config = client_config.clone();
@@ -292,6 +300,7 @@ fn main() {
 
             source.stream
                 .inspect_batch(move |ts, _| {
+                    // Advance with allowed latness.
                     let opt_cap = cap_holder.borrow().clone();
                     if let Some(cap) = opt_cap {
                         let ts2 = cap.time().clone();
@@ -305,15 +314,14 @@ fn main() {
                         };
 
                         if new_time != cap_time {
-                            println!("Worker {}/{}: b = {:?} c = {:?} n = {:?}",
-                                     worker_id + 1, num_workers,
-                                     batch_time, cap_time, new_time);
+                            // println!("Worker {}/{}: b = {:?} c = {:?} n = {:?}",
+                            //          worker_id + 1, num_workers,
+                            //          batch_time, cap_time, new_time);
+                            let mut new_ts = ts.clone();
+                            new_ts.inner = new_time;
+                            let new_cap = cap.delayed(&new_ts);
+                            *cap_holder.borrow_mut() = Some(new_cap);
                         }
-
-                        let mut new_ts = ts.clone();
-                        new_ts.inner = new_time;
-                        let new_cap = cap.delayed(&new_ts);
-                        *cap_holder.borrow_mut() = Some(new_cap);
                     }
                 })
                 .inspect_batch(|t, x| {
