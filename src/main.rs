@@ -19,10 +19,10 @@ use std::str::FromStr;
 use std::time::Duration;
 use timely::Data;
 use timely::dataflow::operators::*;
-use timely::dataflow::operators::feedback::Handle as FeedbackHandle;
+// use timely::dataflow::operators::feedback::Handle as FeedbackHandle;
 use timely::dataflow::operators::generic::source;
 use timely::dataflow::scopes::{Child, Root};
-use timely::dataflow::Stream;
+use timely::dataflow::{InputHandle, Stream};
 use timely::progress::Timestamp;
 use timely::progress::nested::product::Product;
 use timely::progress::timestamp::RootTimestamp;
@@ -133,7 +133,8 @@ struct KafkaPartitionSource<'a, A: Allocate, T: Timestamp, D: Data> {
     stream: Stream<Child<'a, Root<A>, T>, D>,
     cap: Rc<RefCell<Option<Capability<Product<RootTimestamp, T>>>>>,
     // offsets: Rc<RefCell<BTreeSet<i64>>>,
-    offset_handle: FeedbackHandle<RootTimestamp, T, (i32, i64)>,
+    // offset_handle: FeedbackHandle<RootTimestamp, T, (i32, i64)>,
+    offset_handle: InputHandle<T, (i32, i64)>,
 }
 
 impl<'a, A, T, D> KafkaPartitionSource<'a, A, T, D>
@@ -149,8 +150,8 @@ impl<'a, A, T, D> KafkaPartitionSource<'a, A, T, D>
         let offsets = Rc::new(RefCell::new(BTreeSet::new()));
         let worker_id = scope.index() as i32;
         let num_workers = scope.peers() as i32;
-        // let (offset_input_handle, offset_stream) = scope.new_input::<(i32, i64)>();
-        let (offset_input_handle, offset_stream) = scope.loop_variable::<(i32, i64)>(T::from(10), T::Summary::from(1));
+        let (offset_input_handle, offset_stream) = scope.new_input::<(i32, i64)>();
+        // let (offset_input_handle, offset_stream) = scope.loop_variable::<(i32, i64)>(T::from(10), T::Summary::from(1));
 
         let stream = source(scope, "KafkaPartitionSource", |cap| {
             let offsets = offsets.clone();
@@ -231,7 +232,8 @@ struct KafkaTopicSource<'a, A: Allocate, T: Timestamp, D: Data> {
     stream: Stream<Child<'a, Root<A>, T>, D>,
     cap: Rc<RefCell<Option<Capability<Product<RootTimestamp, T>>>>>,
     // offsets: Rc<RefCell<BTreeSet<i64>>>,
-    offset_handle: FeedbackHandle<RootTimestamp, T, (i32, i64)>,
+    // offset_handle: FeedbackHandle<RootTimestamp, T, (i32, i64)>,
+    offset_handle: InputHandle<T, (i32, i64)>,
 }
 
 impl<'a, A, T, D> KafkaTopicSource<'a, A, T, D>
@@ -325,6 +327,8 @@ fn main() {
             }).expect("Unable to create source");
             let cap_holder = source.cap.clone();
 
+            let mut retrier = source.offset_handle;
+
             source.stream
                 .inspect_batch(move |ts, _| {
                     // Advance with allowed latness.
@@ -354,8 +358,12 @@ fn main() {
                 .inspect_batch(|t, x| {
                     println!("{:?}: {:?}", t, x);
                 })
-                .map(|x| (x.partition, x.offset))
-                .connect_loop(source.offset_handle);
+                .inspect(move |x| {
+                    retrier.send((x.partition, x.offset));
+                })
+                // .map(|x| (x.partition, x.offset))
+                // .connect_loop(source.offset_handle)
+                ;
         });
     }).unwrap();
 }
