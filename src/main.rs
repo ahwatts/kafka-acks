@@ -117,8 +117,12 @@ impl ConsumerBuilder {
 }
 
 struct KafkaPartitionSource<'a, A: Allocate, T: Timestamp, D: Data> {
+    // topic: String,
+    partition: i32,
     stream: Stream<Child<'a, Root<A>, T>, D>,
     cap: Rc<RefCell<Option<Capability<Product<RootTimestamp, T>>>>>,
+    offsets: Rc<RefCell<Option<BTreeSet<i64>>>>,
+    consumer: Rc<RefCell<Option<PartitionConsumer>>>,
     offset_handle: InputHandle<T, (i32, i64)>,
     offset_stream: Stream<Child<'a, Root<A>, T>, (i32, i64)>,
 }
@@ -193,36 +197,16 @@ impl<'a, A, T, D> KafkaPartitionSource<'a, A, T, D>
             }
         });
 
-        let this_partition = builder.partition;
         let (offset_input_handle, offset_stream) = scope.new_input::<(i32, i64)>();
 
         KafkaPartitionSource {
+            partition: builder.partition,
             stream: stream,
             cap: cap,
+            offsets: offsets,
+            consumer: consumer,
             offset_handle: offset_input_handle,
-            offset_stream: offset_stream
-                .broadcast()
-                .inspect(move |(partition, offset)| {
-                    if *partition == 0 {
-                        println!("Worker {}: ({}, {})", worker_id, partition, offset);
-                    }
-                })
-                .filter(move |(partition, _)| *partition == this_partition)
-                .inspect_batch(move |time, psnos| {
-                    if let (Some(ref mut offsets), Some(ref _consumer)) = (offsets.borrow_mut().as_mut(), consumer.borrow().as_ref()) {
-                        for (partition, offset) in psnos {
-                            if *partition == 0 {
-                                println!(
-                                    "Worker {}: {:?}: ({}, {}) this_partition = {} offsets = {:?} retiring",
-                                    worker_id, time,
-                                    partition, offset, this_partition,
-                                    offsets,
-                                );
-                            }
-                            offsets.remove(offset);
-                        }
-                    }
-                }),
+            offset_stream: offset_stream,
         }
     }
 }
@@ -243,6 +227,7 @@ impl<'a, A, T, D> KafkaTopicSource<'a, A, T, D>
     fn new<L>(scope: &mut Child<'a, Root<A>, T>, config: ClientConfig, topic: &str, logic: L) -> KtResult<KafkaTopicSource<'a, A, T, D>>
         where L: 'static + Clone + Fn(&BorrowedMessage) -> Option<(Product<RootTimestamp, T>, D)>
     {
+        let worker_id = scope.index();
         let partition_ids = Self::partition_ids(&config, topic)
             .expect("Could not fetch partition ids");
 
@@ -266,11 +251,32 @@ impl<'a, A, T, D> KafkaTopicSource<'a, A, T, D>
             ))))
         } else {
             let active_source = active_sources.into_iter().next().unwrap();
+            let this_partition = active_source.partition;
+            let offsets = active_source.offsets;
+            let consumer = active_source.consumer;
             Ok(KafkaTopicSource {
                 stream: scope.concatenate(streams),
                 cap: active_source.cap.clone(),
                 offset_handle: active_source.offset_handle,
-                _offset_stream: scope.concatenate(offset_streams),
+                _offset_stream: scope.concatenate(offset_streams)
+                    .broadcast()
+                    // .inspect(move |(partition, offset)| {
+                    //     println!("Worker {}: ({}, {})", worker_id, partition, offset);
+                    // })
+                    .filter(move |(partition, _)| *partition == this_partition)
+                    .inspect_batch(move |time, psnos| {
+                        if let (Some(ref mut offsets), Some(ref _consumer)) = (offsets.borrow_mut().as_mut(), consumer.borrow().as_ref()) {
+                            for (partition, offset) in psnos {
+                                println!(
+                                    "Worker {}: {:?}: ({}, {}) this_partition = {} offsets = {:?} retiring",
+                                    worker_id, time,
+                                    partition, offset, this_partition,
+                                    offsets,
+                                );
+                                offsets.remove(offset);
+                            }
+                        }
+                    }),
             })
         }
     }
@@ -354,9 +360,7 @@ fn main() {
                 })
                 .exchange(|x| x.data as u64 % 3)
                 .inspect_batch(move |t, x| {
-                    if x.iter().next().unwrap().partition == 0 {
-                        println!("Worker {}: {:?}: {:?}", worker_id, t, x);
-                    }
+                    println!("Worker {}: {:?}: {:?}", worker_id, t, x);
                 })
                 .inspect_batch(move |t, xs| {
                     let epoch = *retrier.epoch();
