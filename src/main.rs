@@ -146,12 +146,53 @@ impl ConsumerBuilder {
     }
 }
 
+#[derive(Clone, Debug)]
+struct PartitionOffsetManager {
+    live_offsets: BTreeSet<i64>,
+    high_water_mark: Option<i64>,
+}
+
+impl PartitionOffsetManager {
+    fn new() -> PartitionOffsetManager {
+        PartitionOffsetManager {
+            live_offsets: BTreeSet::new(),
+            high_water_mark: None,
+        }
+    }
+
+    fn birth(&mut self, offset: i64) {
+        self.live_offsets.insert(offset);
+        match self.high_water_mark {
+            Some(hwm) => {
+                if offset > hwm {
+                    self.high_water_mark = Some(offset);
+                }
+            },
+            None => {
+                self.high_water_mark = Some(offset);
+            },
+        }
+    }
+
+    fn retire(&mut self, offset: i64) {
+        self.live_offsets.remove(&offset);
+    }
+
+    fn offset_to_commit(&self) -> Option<i64> {
+        match (self.live_offsets.iter().next(), self.high_water_mark) {
+            (Some(off), _) => Some(*off),
+            (None, Some(hwm)) => Some(hwm),
+            (None, None) => None,
+        }
+    }
+}
+
 struct KafkaPartitionSource<'a, A: Allocate, T: Timestamp, D: Data> {
     // topic: String,
     partition: i32,
     stream: Stream<Child<'a, Root<A>, T>, D>,
     cap: Rc<RefCell<Option<Capability<Product<RootTimestamp, T>>>>>,
-    offsets: Rc<RefCell<Option<BTreeSet<i64>>>>,
+    offsets: Rc<RefCell<Option<PartitionOffsetManager>>>,
     consumer: Rc<RefCell<Option<PartitionConsumer>>>,
     offset_handle: InputHandle<T, (i32, i64)>,
     offset_stream: Stream<Child<'a, Root<A>, T>, (i32, i64)>,
@@ -179,7 +220,7 @@ impl<'a, A, T, D> KafkaPartitionSource<'a, A, T, D>
 
             if builder.build_for_worker(worker_id, num_workers) {
                 *cap.borrow_mut() = Some(src_cap);
-                *offsets.borrow_mut() = Some(BTreeSet::new());
+                *offsets.borrow_mut() = Some(PartitionOffsetManager::new());
                 *consumer.borrow_mut() = Some(builder.build_consumer().expect("Could not build consumer"));
             }
 
@@ -216,7 +257,7 @@ impl<'a, A, T, D> KafkaPartitionSource<'a, A, T, D>
                             let block_cap = cap.delayed(&block_ts);
                             let mut session = output.session(&block_cap);
                             for (orig, processed) in block {
-                                offsets.insert(orig.offset());
+                                offsets.birth(orig.offset());
                                 session.give(processed);
                             }
                         } else {
@@ -296,19 +337,15 @@ impl<'a, A, T, D> KafkaTopicSource<'a, A, T, D>
                     .filter(move |(partition, _)| *partition == this_partition)
                     .inspect_batch(move |time, psnos| {
                         if let (Some(ref mut offsets), Some(ref consumer)) = (offsets.borrow_mut().as_mut(), consumer.borrow().as_ref()) {
-                            let high_water_mark = offsets.iter().last().cloned();
-
                             for (partition, offset) in psnos {
                                 println!(
-                                    "Worker {}: {:?}: ({}, {}) this_partition = {} offsets = {:?} retiring",
+                                    "Worker {}: {:?}: ({}, {}) this_partition = {} offsets = {:?} retiring {}",
                                     worker_id, time,
                                     partition, offset, this_partition,
-                                    offsets,
+                                    offsets, offset,
                                 );
-                                offsets.remove(offset);
+                                offsets.retire(*offset);
                             }
-
-                            let low_water_mark = offsets.iter().next().cloned();
 
                             let old_offset = match consumer.committed() {
                                 Ok(old_offset) => old_offset,
@@ -318,11 +355,10 @@ impl<'a, A, T, D> KafkaTopicSource<'a, A, T, D>
                                 }
                             };
 
-                            let new_offset = match (old_offset, low_water_mark, high_water_mark) {
-                                (_, Some(lwm), _) => Offset::Offset(lwm),
-                                (_, None, Some(hwm)) => Offset::Offset(hwm),
-                                (Offset::Offset(old), None, None) => Offset::Offset(old),
-                                (v @ _, None, None) => v,
+                            let new_offset = match (old_offset, offsets.offset_to_commit()) {
+                                (_, Some(off)) => Offset::Offset(off),
+                                (Offset::Offset(off), None) => Offset::Offset(off),
+                                (v @ _, None) => v,
                             };
 
                             if old_offset != new_offset {
