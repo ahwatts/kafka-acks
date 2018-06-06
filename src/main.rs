@@ -7,9 +7,10 @@ extern crate timely_communication;
 #[macro_use] extern crate abomonation_derive;
 #[macro_use] extern crate error_chain;
 
-use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::message::{BorrowedMessage, Message};
+use rdkafka::topic_partition_list::Offset;
 use rdkafka::{ClientConfig, TopicPartitionList};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -41,6 +42,10 @@ error_chain! {
             description("Unknown topic"),
             display("Unknown topic: {:?}", topic),
         }
+        UnknownTopicPartition(topic: String, partition: i32) {
+            description("Unknown topic-partition pair"),
+            display("Unknown topic-partition pair: {}:{}", topic, partition)
+        }
         TooManyCaps(desc: String) {
             description("Worker has too many capabilities"),
             display("{}", desc),
@@ -49,6 +54,8 @@ error_chain! {
 }
 
 struct PartitionConsumer {
+    topic: String,
+    partition: i32,
     consumer: BaseConsumer,
 }
 
@@ -64,6 +71,8 @@ impl PartitionConsumer {
             .map_err(|e| format!("Error assigning topic partition to consumer: {}", e))?;
 
         Ok(PartitionConsumer {
+            topic: topic,
+            partition: partition,
             consumer: consumer,
         })
     }
@@ -89,6 +98,27 @@ impl PartitionConsumer {
         }
 
         Ok(rcvd_messages)
+    }
+
+    fn committed(&self) -> KtResult<Offset> {
+        self.consumer.committed(Duration::from_millis(1000))
+            .map_err(|e| KtError::from(e))
+            .and_then(|tpl| {
+                tpl.to_topic_map().get(&(self.topic.clone(), self.partition))
+                    .cloned()
+                    .ok_or_else(|| {
+                        KtError::from(KtErrorKind::UnknownTopicPartition(
+                            self.topic.clone(),
+                            self.partition,
+                        ))
+                    })
+            })
+    }
+
+    fn commit(&self, offset: Offset) -> KtResult<()> {
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition_offset(&self.topic, self.partition, offset);
+        self.consumer.commit(&tpl, CommitMode::Async).map_err(|e| KtError::from(e))
     }
 }
 
@@ -265,7 +295,7 @@ impl<'a, A, T, D> KafkaTopicSource<'a, A, T, D>
                     // })
                     .filter(move |(partition, _)| *partition == this_partition)
                     .inspect_batch(move |time, psnos| {
-                        if let (Some(ref mut offsets), Some(ref _consumer)) = (offsets.borrow_mut().as_mut(), consumer.borrow().as_ref()) {
+                        if let (Some(ref mut offsets), Some(ref consumer)) = (offsets.borrow_mut().as_mut(), consumer.borrow().as_ref()) {
                             for (partition, offset) in psnos {
                                 println!(
                                     "Worker {}: {:?}: ({}, {}) this_partition = {} offsets = {:?} retiring",
@@ -274,6 +304,28 @@ impl<'a, A, T, D> KafkaTopicSource<'a, A, T, D>
                                     offsets,
                                 );
                                 offsets.remove(offset);
+                            }
+
+                            let old_offset = match consumer.committed() {
+                                Ok(old_offset) => old_offset,
+                                Err(e) => {
+                                    eprintln!("Worker {}: Unable to fetch current offset: {}", worker_id, e);
+                                    Offset::Invalid
+                                }
+                            };
+
+                            let new_offset = match (old_offset, offsets.iter().next()) {
+                                (Offset::Offset(_), Some(new)) => Offset::Offset(*new),
+                                (Offset::Offset(old), None) => Offset::Offset(old),
+                                (_, Some(new)) => Offset::Offset(*new),
+                                (v @ _, None) => v,
+                            };
+
+                            if old_offset != new_offset {
+                                println!("Worker {}: Committing offset: {:?} -> {:?}", worker_id, old_offset, new_offset);
+                                if let Err(e) = consumer.commit(new_offset) {
+                                    eprintln!("Worker {}: Error committing new offset {:?}: {}", worker_id, new_offset, e);
+                                }
                             }
                         }
                     }),
