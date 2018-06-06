@@ -296,6 +296,8 @@ impl<'a, A, T, D> KafkaTopicSource<'a, A, T, D>
                     .filter(move |(partition, _)| *partition == this_partition)
                     .inspect_batch(move |time, psnos| {
                         if let (Some(ref mut offsets), Some(ref consumer)) = (offsets.borrow_mut().as_mut(), consumer.borrow().as_ref()) {
+                            let high_water_mark = offsets.iter().last().cloned();
+
                             for (partition, offset) in psnos {
                                 println!(
                                     "Worker {}: {:?}: ({}, {}) this_partition = {} offsets = {:?} retiring",
@@ -306,6 +308,8 @@ impl<'a, A, T, D> KafkaTopicSource<'a, A, T, D>
                                 offsets.remove(offset);
                             }
 
+                            let low_water_mark = offsets.iter().next().cloned();
+
                             let old_offset = match consumer.committed() {
                                 Ok(old_offset) => old_offset,
                                 Err(e) => {
@@ -314,11 +318,11 @@ impl<'a, A, T, D> KafkaTopicSource<'a, A, T, D>
                                 }
                             };
 
-                            let new_offset = match (old_offset, offsets.iter().next()) {
-                                (Offset::Offset(_), Some(new)) => Offset::Offset(*new),
-                                (Offset::Offset(old), None) => Offset::Offset(old),
-                                (_, Some(new)) => Offset::Offset(*new),
-                                (v @ _, None) => v,
+                            let new_offset = match (old_offset, low_water_mark, high_water_mark) {
+                                (_, Some(lwm), _) => Offset::Offset(lwm),
+                                (_, None, Some(hwm)) => Offset::Offset(hwm),
+                                (Offset::Offset(old), None, None) => Offset::Offset(old),
+                                (v @ _, None, None) => v,
                             };
 
                             if old_offset != new_offset {
